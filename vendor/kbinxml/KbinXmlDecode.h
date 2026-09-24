@@ -29,6 +29,12 @@ private:
 // Returns true and sets *rootOut to real root (first child of synthetic wrapper), or false on error.
 bool KbinXmlDecodeFromBinary(const Byte *data, size_t size, CKbinXmlNode *&rootOut);
 
+// Decode plaintext XML (UTF-8 or UTF-16 BOM). Trailing NUL bytes should be stripped by the caller.
+bool KbinXmlDecodeFromPlainXml(const Byte *data, size_t size, CKbinXmlNode *&rootOut);
+
+// Binary kbinxml if signature matches; otherwise strip trailing NULs and parse as plaintext XML.
+bool KbinXmlDecodeAuto(const Byte *data, size_t size, CKbinXmlNode *&rootOut);
+
 bool KbinXmlIsBinaryXml(const Byte *data, size_t size);
 
 // Serializes decoded tree to UTF-8 XML text (declaration + elements). Does not own root.

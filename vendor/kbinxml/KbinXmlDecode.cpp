@@ -685,3 +685,339 @@ bool KbinXmlDecodeFromBinary(const Byte *data, size_t size, CKbinXmlNode *&rootO
   delete wrapper;
   return true;
 }
+
+namespace {
+
+static void SkipWs(const Byte *&p, const Byte *end)
+{
+  while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n'))
+    p++;
+}
+
+static bool DecodeXmlEntity(const Byte *&p, const Byte *end, wchar_t &out)
+{
+  if (p >= end || *p != '&')
+    return false;
+  const Byte *s = p + 1;
+  if (s + 3 <= end && s[0] == 'a' && s[1] == 'm' && s[2] == 'p' && s + 3 < end && s[3] == ';')
+  {
+    out = L'&';
+    p = s + 4;
+    return true;
+  }
+  if (s + 2 <= end && s[0] == 'l' && s[1] == 't' && s + 2 < end && s[2] == ';')
+  {
+    out = L'<';
+    p = s + 3;
+    return true;
+  }
+  if (s + 2 <= end && s[0] == 'g' && s[1] == 't' && s + 2 < end && s[2] == ';')
+  {
+    out = L'>';
+    p = s + 3;
+    return true;
+  }
+  if (s + 4 <= end && s[0] == 'q' && s[1] == 'u' && s[2] == 'o' && s[3] == 't' && s + 4 < end && s[4] == ';')
+  {
+    out = L'"';
+    p = s + 5;
+    return true;
+  }
+  if (s + 3 <= end && s[0] == 'a' && s[1] == 'p' && s[2] == 'o' && s[3] == 's' && s + 4 < end && s[4] == ';')
+  {
+    out = L'\'';
+    p = s + 5;
+    return true;
+  }
+  if (s < end && *s == '#')
+  {
+    s++;
+    UInt32 v = 0;
+    bool hex = false;
+    if (s < end && (*s == 'x' || *s == 'X'))
+    {
+      hex = true;
+      s++;
+    }
+    if (s >= end)
+      return false;
+    if (hex)
+    {
+      while (s < end && *s != ';')
+      {
+        Byte c = *s++;
+        v <<= 4;
+        if (c >= '0' && c <= '9') v |= (UInt32)(c - '0');
+        else if (c >= 'a' && c <= 'f') v |= (UInt32)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') v |= (UInt32)(c - 'A' + 10);
+        else return false;
+        if (v > 0x10FFFF) return false;
+      }
+    }
+    else
+    {
+      while (s < end && *s != ';')
+      {
+        Byte c = *s++;
+        if (c < '0' || c > '9') return false;
+        v = v * 10 + (UInt32)(c - '0');
+        if (v > 0x10FFFF) return false;
+      }
+    }
+    if (s >= end || *s != ';') return false;
+    p = s + 1;
+    if (v == 0 || v > 0xFFFF)
+      out = L'?';
+    else
+      out = (wchar_t)v;
+    return true;
+  }
+  return false;
+}
+
+static bool ReadXmlName(const Byte *&p, const Byte *end, UString &name)
+{
+  name.Empty();
+  if (p >= end)
+    return false;
+  const Byte c0 = *p;
+  if (!((c0 >= 'A' && c0 <= 'Z') || (c0 >= 'a' && c0 <= 'z') || c0 == '_' || c0 == ':'))
+    return false;
+  while (p < end)
+  {
+    const Byte c = *p;
+    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+        || c == '_' || c == ':' || c == '-' || c == '.')
+    {
+      name += (wchar_t)c;
+      p++;
+      continue;
+    }
+    break;
+  }
+  return !name.IsEmpty();
+}
+
+static bool ReadQuotedAttr(const Byte *&p, const Byte *end, UString &val)
+{
+  val.Empty();
+  if (p >= end || (*p != '"' && *p != '\''))
+    return false;
+  const Byte q = *p++;
+  while (p < end && *p != q)
+  {
+    if (*p == '&')
+    {
+      wchar_t w = 0;
+      if (!DecodeXmlEntity(p, end, w))
+        return false;
+      val += w;
+      continue;
+    }
+    val += (wchar_t)*p++;
+  }
+  if (p >= end || *p != q)
+    return false;
+  p++;
+  return true;
+}
+
+static bool ParseElement(const Byte *&p, const Byte *end, CKbinXmlNode *parent);
+
+static bool ParseChildrenAndText(const Byte *&p, const Byte *end, CKbinXmlNode *node)
+{
+  UString textAcc;
+  for (;;)
+  {
+    SkipWs(p, end);
+    if (p >= end)
+      return false;
+    if (*p == '<')
+    {
+      if (p + 1 < end && p[1] == '/')
+      {
+        // closing tag for this node
+        p += 2;
+        UString closeName;
+        if (!ReadXmlName(p, end, closeName))
+          return false;
+        SkipWs(p, end);
+        if (p >= end || *p != '>')
+          return false;
+        p++;
+        if (closeName != node->Tag)
+          return false;
+        // trim text
+        while (!textAcc.IsEmpty() && (textAcc.Back() == L' ' || textAcc.Back() == L'\t'
+            || textAcc.Back() == L'\r' || textAcc.Back() == L'\n'))
+          textAcc.DeleteBack();
+        node->Text = textAcc;
+        return true;
+      }
+      if (!ParseElement(p, end, node))
+        return false;
+      continue;
+    }
+    // text content
+    while (p < end && *p != '<')
+    {
+      if (*p == '&')
+      {
+        wchar_t w = 0;
+        if (!DecodeXmlEntity(p, end, w))
+          return false;
+        textAcc += w;
+        continue;
+      }
+      textAcc += (wchar_t)*p++;
+    }
+  }
+}
+
+static bool ParseElement(const Byte *&p, const Byte *end, CKbinXmlNode *parent)
+{
+  SkipWs(p, end);
+  if (p >= end || *p != '<')
+    return false;
+  p++;
+  // skip comments / PI / doctype
+  if (p < end && (*p == '!' || *p == '?'))
+  {
+    if (*p == '!' && p + 2 < end && p[1] == '-' && p[2] == '-')
+    {
+      p += 3;
+      while (p + 2 < end && !(p[0] == '-' && p[1] == '-' && p[2] == '>'))
+        p++;
+      if (p + 2 >= end) return false;
+      p += 3;
+      return true;
+    }
+    // PI or other declaration: skip until ?>
+    while (p + 1 < end && !(p[0] == '?' && p[1] == '>'))
+      p++;
+    if (p + 1 >= end) return false;
+    p += 2;
+    return true;
+  }
+
+  UString tag;
+  if (!ReadXmlName(p, end, tag))
+    return false;
+
+  CKbinXmlNode *node = new CKbinXmlNode();
+  node->Tag = tag;
+  parent->Children.Add(node);
+
+  for (;;)
+  {
+    SkipWs(p, end);
+    if (p >= end)
+      return false;
+    if (*p == '/')
+    {
+      p++;
+      SkipWs(p, end);
+      if (p >= end || *p != '>')
+        return false;
+      p++;
+      return true;
+    }
+    if (*p == '>')
+    {
+      p++;
+      return ParseChildrenAndText(p, end, node);
+    }
+    UString attrKey;
+    if (!ReadXmlName(p, end, attrKey))
+      return false;
+    SkipWs(p, end);
+    if (p >= end || *p != '=')
+      return false;
+    p++;
+    SkipWs(p, end);
+    UString attrVal;
+    if (!ReadQuotedAttr(p, end, attrVal))
+      return false;
+    if (attrKey == L"__type")
+      node->TypeAttr = attrVal;
+    else if (attrKey == L"__count")
+    {
+      // optional; keep as attribute too
+      CKbinXmlNode::CAttr a;
+      a.Key = attrKey;
+      a.Val = attrVal;
+      node->Attrs.Add(a);
+    }
+    else
+    {
+      CKbinXmlNode::CAttr a;
+      a.Key = attrKey;
+      a.Val = attrVal;
+      node->Attrs.Add(a);
+    }
+  }
+}
+
+} // namespace
+
+bool KbinXmlDecodeFromPlainXml(const Byte *data, size_t size, CKbinXmlNode *&rootOut)
+{
+  rootOut = NULL;
+  if (!data || size == 0)
+    return false;
+
+  const Byte *p = data;
+  const Byte *end = data + size;
+
+  // Skip UTF-8 BOM
+  if (size >= 3 && p[0] == 0xEF && p[1] == 0xBB && p[2] == 0xBF)
+    p += 3;
+
+  CKbinXmlNode *wrapper = new CKbinXmlNode();
+  // Skip leading PIs/comments by calling ParseElement until we get a real element
+  while (p < end)
+  {
+    SkipWs(p, end);
+    if (p >= end)
+      break;
+    if (*p != '<')
+    {
+      delete wrapper;
+      return false;
+    }
+    const unsigned before = wrapper->Children.Size();
+    if (!ParseElement(p, end, wrapper))
+    {
+      delete wrapper;
+      return false;
+    }
+    if (wrapper->Children.Size() > before)
+      break; // got a real element (comments/PI don't add children... wait, comments return true without adding)
+  }
+
+  if (wrapper->Children.Size() != 1)
+  {
+    delete wrapper;
+    return false;
+  }
+  rootOut = wrapper->Children[0];
+  wrapper->Children.Delete(0);
+  delete wrapper;
+  return true;
+}
+
+bool KbinXmlDecodeAuto(const Byte *data, size_t size, CKbinXmlNode *&rootOut)
+{
+  rootOut = NULL;
+  if (!data || size == 0)
+    return false;
+  if (KbinXmlIsBinaryXml(data, size))
+    return KbinXmlDecodeFromBinary(data, size, rootOut);
+
+  // Strip trailing NULs (LovePlus / ifstools 3d06973)
+  while (size > 0 && data[size - 1] == 0)
+    size--;
+  if (size == 0)
+    return false;
+  return KbinXmlDecodeFromPlainXml(data, size, rootOut);
+}

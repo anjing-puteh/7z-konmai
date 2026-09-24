@@ -2,6 +2,11 @@
 
 #include "StdAfx.h"
 
+#include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 #include "../../Common/ComTry.h"
@@ -11,9 +16,12 @@
 #include "../../Windows/PropVariant.h"
 
 #include "../Common/LimitedStreams.h"
+#include "../Common/ProgressUtils.h"
 #include "../Common/RegisterArc.h"
 #include "../Common/StreamObjects.h"
 #include "../Common/StreamUtils.h"
+
+#include "../Compress/CopyCoder.h"
 
 #include "HandlerCont.h"
 
@@ -106,9 +114,6 @@ Z7_class_CHandler_final: public CHandlerCont
     if (pos != item.PackOffset || size != item.UnpackSize)
       return S_FALSE;
 
-    CMyComPtr<ISequentialInStream> limited;
-    RINOK(CreateLimitedInStream(_stream, item.PackOffset, item.PackSize, &limited))
-
     if (item.PackSize == 0)
     {
       if (item.UnpackSize != 0)
@@ -117,22 +122,26 @@ Z7_class_CHandler_final: public CHandlerCont
       return S_OK;
     }
 
+    // Stored payload: stream the packed bytes. LZ77 stays a one-file decode for
+    // GetStream / preview; bulk Extract pipelines it below.
+    if (item.PackSize == item.UnpackSize)
+      return CreateLimitedInStream(_stream, item.PackOffset, item.PackSize, stream);
+
     CByteBuffer packed;
     packed.Alloc((size_t)item.PackSize);
-    RINOK(ReadStream_FAIL(limited, packed, (size_t)item.PackSize))
+    RINOK(InStream_SeekSet(_stream, item.PackOffset))
+    RINOK(ReadStream_FAIL(_stream, packed, (size_t)item.PackSize))
 
-    if (item.PackSize == item.UnpackSize)
-    {
-      Create_BufInStream_WithNewBuffer(packed, packed.Size(), stream);
-      return S_OK;
-    }
-
-    std::vector<uint8_t> dec = util::lz77::decompress(packed, (size_t)item.PackSize);
+    std::vector<uint8_t> dec = util::lz77::decompress(packed, (size_t)item.PackSize,
+        (size_t)item.UnpackSize);
     if (dec.size() != (size_t)item.UnpackSize)
       return S_FALSE;
     Create_BufInStream_WithNewBuffer(dec.empty() ? NULL : &dec[0], dec.size(), stream);
     return S_OK;
   }
+
+  Z7_COM7F_IMP(Extract(const UInt32 *indices, UInt32 numItems, Int32 testMode,
+      IArchiveExtractCallback *extractCallback))
 };
 
 static const Byte kProps[] =
@@ -279,6 +288,321 @@ Z7_COM7F_IMF(CHandler::GetNumberOfItems(UInt32 *numItems))
 {
   *numItems = _items.Size();
   return S_OK;
+}
+
+static bool ArcItemIsLz77(const CItem &item)
+{
+  return item.PackSize != item.UnpackSize && item.PackSize != 0;
+}
+
+Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 numItems,
+    Int32 testMode, IArchiveExtractCallback *extractCallback))
+{
+  COM_TRY_BEGIN
+  const bool allFilesMode = (numItems == (UInt32)(Int32)-1);
+  if (allFilesMode)
+  {
+    RINOK(GetNumberOfItems(&numItems))
+  }
+  if (numItems == 0)
+    return S_OK;
+
+  UInt64 totalSize = 0;
+  for (UInt32 i = 0; i < numItems; i++)
+  {
+    const UInt32 index = allFilesMode ? i : indices[i];
+    if (index < _items.Size())
+      totalSize += _items[index].UnpackSize;
+  }
+  RINOK(extractCallback->SetTotal(totalSize))
+
+  CMyComPtr2_Create<ICompressProgressInfo, CLocalProgress> lps;
+  lps->Init(extractCallback, false);
+  CMyComPtr2_Create<ICompressCoder, NCompress::CCopyCoder> copyCoder;
+
+  unsigned window = (unsigned)std::thread::hardware_concurrency();
+  if (window == 0)
+    window = 4;
+  window = (std::min)(window, 8u);
+  window = (std::max)(window, 1u);
+
+  struct Slot
+  {
+    bool Needed;
+    bool Ready;
+    bool Done;
+    bool Ok;
+    std::vector<Byte> Packed;
+    std::vector<uint8_t> Dec;
+    Slot(): Needed(false), Ready(false), Done(false), Ok(false) {}
+  };
+
+  std::vector<Slot> slots((size_t)numItems);
+  for (UInt32 i = 0; i < numItems; i++)
+  {
+    const UInt32 index = allFilesMode ? i : indices[i];
+    if (index < _items.Size() && ArcItemIsLz77(_items[index]))
+      slots[(size_t)i].Needed = true;
+  }
+
+  std::mutex mtx;
+  std::condition_variable cv;
+  std::atomic<bool> abortFlag(false);
+  std::atomic<UInt32> nextPrefetch(0);
+  std::atomic<UInt32> nextToDecode(0);
+
+  auto ensurePrefetched = [&](UInt32 upToExclusive) -> HRESULT
+  {
+    for (;;)
+    {
+      UInt32 i = nextPrefetch.load(std::memory_order_relaxed);
+      if (i >= upToExclusive || i >= numItems)
+        break;
+      if (!nextPrefetch.compare_exchange_weak(i, i + 1, std::memory_order_relaxed))
+        continue;
+      if (!slots[(size_t)i].Needed)
+        continue;
+      const UInt32 index = allFilesMode ? i : indices[i];
+      const CItem &item = _items[index];
+      std::vector<Byte> packed((size_t)item.PackSize);
+      RINOK(InStream_SeekSet(_stream, item.PackOffset))
+      RINOK(ReadStream_FAIL(_stream, packed.data(), packed.size()))
+      {
+        std::lock_guard<std::mutex> lock(mtx);
+        slots[(size_t)i].Packed.swap(packed);
+        slots[(size_t)i].Ready = true;
+      }
+      cv.notify_all();
+    }
+    return S_OK;
+  };
+
+  auto workerFn = [&]()
+  {
+    for (;;)
+    {
+      if (abortFlag.load(std::memory_order_relaxed))
+        break;
+      const UInt32 i = nextToDecode.fetch_add(1, std::memory_order_relaxed);
+      if (i >= numItems)
+        break;
+      if (!slots[(size_t)i].Needed)
+        continue;
+
+      std::vector<Byte> packed;
+      {
+        std::unique_lock<std::mutex> lock(mtx);
+        cv.wait(lock, [&]() {
+          return abortFlag.load(std::memory_order_relaxed) || slots[(size_t)i].Ready;
+        });
+        if (abortFlag.load(std::memory_order_relaxed) && !slots[(size_t)i].Ready)
+          break;
+        packed.swap(slots[(size_t)i].Packed);
+      }
+
+      const UInt32 index = allFilesMode ? i : indices[i];
+      const CItem &item = _items[index];
+      std::vector<uint8_t> dec;
+      bool ok = false;
+      try
+      {
+        dec = util::lz77::decompress(packed.empty() ? NULL : packed.data(),
+            packed.size(), (size_t)item.UnpackSize);
+        ok = dec.size() == (size_t)item.UnpackSize;
+      }
+      catch (...)
+      {
+        ok = false;
+        dec.clear();
+      }
+      packed.clear();
+
+      {
+        std::lock_guard<std::mutex> lock(mtx);
+        slots[(size_t)i].Ok = ok;
+        slots[(size_t)i].Dec.swap(dec);
+        slots[(size_t)i].Done = true;
+      }
+      cv.notify_all();
+    }
+  };
+
+  RINOK(ensurePrefetched((std::min)(numItems, (UInt32)window)))
+
+  std::vector<std::thread> workers;
+  workers.reserve((size_t)window);
+  for (unsigned w = 0; w < window; w++)
+    workers.emplace_back(workerFn);
+
+  UInt64 completed = 0;
+  HRESULT failHr = S_OK;
+
+  for (UInt32 i = 0; i < numItems; i++)
+  {
+    {
+      const UInt32 ahead = i + (UInt32)window + 1;
+      const HRESULT phr = ensurePrefetched((std::min)(numItems, ahead));
+      if (phr != S_OK)
+      {
+        failHr = phr;
+        abortFlag.store(true, std::memory_order_relaxed);
+        cv.notify_all();
+        break;
+      }
+    }
+
+    lps->InSize = completed;
+    lps->OutSize = completed;
+    {
+      const HRESULT phr = lps->SetCur();
+      if (phr != S_OK)
+      {
+        failHr = phr;
+        abortFlag.store(true, std::memory_order_relaxed);
+        cv.notify_all();
+        break;
+      }
+    }
+
+    const Int32 askMode = testMode ?
+        NExtract::NAskMode::kTest :
+        NExtract::NAskMode::kExtract;
+    const UInt32 index = allFilesMode ? i : indices[i];
+
+    CMyComPtr<ISequentialOutStream> outStream;
+    {
+      const HRESULT phr = extractCallback->GetStream(index, &outStream, askMode);
+      if (phr != S_OK)
+      {
+        failHr = phr;
+        abortFlag.store(true, std::memory_order_relaxed);
+        cv.notify_all();
+        break;
+      }
+    }
+
+    UInt64 unpackSize = 0;
+    if (index < _items.Size())
+      unpackSize = _items[index].UnpackSize;
+    completed += unpackSize;
+
+    if (!testMode && !outStream)
+    {
+      if (slots[(size_t)i].Needed)
+      {
+        std::unique_lock<std::mutex> lock(mtx);
+        cv.wait(lock, [&]() {
+          return abortFlag.load(std::memory_order_relaxed) || slots[(size_t)i].Done;
+        });
+        slots[(size_t)i].Dec.clear();
+        slots[(size_t)i].Packed.clear();
+      }
+      continue;
+    }
+
+    {
+      const HRESULT phr = extractCallback->PrepareOperation(askMode);
+      if (phr != S_OK)
+      {
+        failHr = phr;
+        abortFlag.store(true, std::memory_order_relaxed);
+        cv.notify_all();
+        break;
+      }
+    }
+
+    int opRes = NExtract::NOperationResult::kDataError;
+    if (index >= _items.Size())
+    {
+      const HRESULT phr = extractCallback->SetOperationResult(opRes);
+      if (phr != S_OK)
+      {
+        failHr = phr;
+        abortFlag.store(true, std::memory_order_relaxed);
+        cv.notify_all();
+        break;
+      }
+      continue;
+    }
+
+    const CItem &item = _items[index];
+    if (item.PackSize == 0 && item.UnpackSize != 0)
+      opRes = NExtract::NOperationResult::kDataError;
+    else if (slots[(size_t)i].Needed)
+    {
+      {
+        std::unique_lock<std::mutex> lock(mtx);
+        cv.wait(lock, [&]() {
+          return abortFlag.load(std::memory_order_relaxed) || slots[(size_t)i].Done;
+        });
+      }
+      if (abortFlag.load(std::memory_order_relaxed) && !slots[(size_t)i].Done)
+        break;
+
+      if (!slots[(size_t)i].Ok)
+        opRes = NExtract::NOperationResult::kDataError;
+      else
+      {
+        CMyComPtr<ISequentialInStream> inStream;
+        std::vector<uint8_t> &dec = slots[(size_t)i].Dec;
+        Create_BufInStream_WithReference(dec.empty() ? NULL : dec.data(), dec.size(),
+            NULL, &inStream);
+        const HRESULT codeHr = copyCoder.Interface()->Code(inStream, outStream, NULL, NULL, lps);
+        const UInt64 wrote = copyCoder->TotalSize;
+        dec.clear();
+        if (codeHr != S_OK)
+          opRes = NExtract::NOperationResult::kDataError;
+        else if (wrote == item.UnpackSize)
+          opRes = NExtract::NOperationResult::kOK;
+        else if (wrote < item.UnpackSize)
+          opRes = NExtract::NOperationResult::kUnexpectedEnd;
+        else
+          opRes = NExtract::NOperationResult::kDataError;
+      }
+    }
+    else
+    {
+      CMyComPtr<ISequentialInStream> inStream;
+      const HRESULT cr = CreateLimitedInStream(_stream, item.PackOffset, item.PackSize, &inStream);
+      if (cr != S_OK || !inStream)
+        opRes = NExtract::NOperationResult::kDataError;
+      else
+      {
+        const HRESULT codeHr = copyCoder.Interface()->Code(inStream, outStream, NULL, NULL, lps);
+        const UInt64 wrote = copyCoder->TotalSize;
+        if (codeHr != S_OK)
+          opRes = NExtract::NOperationResult::kDataError;
+        else if (wrote == item.UnpackSize)
+          opRes = NExtract::NOperationResult::kOK;
+        else if (wrote < item.UnpackSize)
+          opRes = NExtract::NOperationResult::kUnexpectedEnd;
+        else
+          opRes = NExtract::NOperationResult::kDataError;
+      }
+    }
+
+    outStream.Release();
+    {
+      const HRESULT phr = extractCallback->SetOperationResult(opRes);
+      if (phr != S_OK)
+      {
+        failHr = phr;
+        abortFlag.store(true, std::memory_order_relaxed);
+        cv.notify_all();
+        break;
+      }
+    }
+  }
+
+  abortFlag.store(true, std::memory_order_relaxed);
+  cv.notify_all();
+  for (size_t w = 0; w < workers.size(); w++)
+    workers[w].join();
+
+  if (failHr != S_OK)
+    return failHr;
+  return S_OK;
+  COM_TRY_END
 }
 
 static const Byte k_Signature[] =

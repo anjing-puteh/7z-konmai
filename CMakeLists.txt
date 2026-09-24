@@ -61,7 +61,7 @@ add_library(FormatBar SHARED
   "${CMAKE_CURRENT_SOURCE_DIR}/vendor/arc/DdrLz77.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/vendor/kbinxml/KbinXmlDecode.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/vendor/kbinxml/KbinXmlSerialize.cpp"
-  "${CMAKE_CURRENT_SOURCE_DIR}/vendor/lodepng/lodepng.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/vendor/fpng/fpng.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/vendor/ifs_tex/IfsTexToPng.cpp"
 )
 
@@ -70,7 +70,7 @@ target_include_directories(FormatBar PRIVATE
   "${Z7}/C"
   "${CMAKE_CURRENT_SOURCE_DIR}/vendor/arc"
   "${CMAKE_CURRENT_SOURCE_DIR}/vendor/kbinxml"
-  "${CMAKE_CURRENT_SOURCE_DIR}/vendor/lodepng"
+  "${CMAKE_CURRENT_SOURCE_DIR}/vendor/fpng"
   "${CMAKE_CURRENT_SOURCE_DIR}/vendor/ifs_tex"
 )
 
@@ -83,6 +83,8 @@ target_compile_definitions(FormatBar PRIVATE
 
 if(MSVC)
   target_compile_options(FormatBar PRIVATE /GR /W3 /EHsc)
+  # fpng uses SSE4.1 intrinsics on x64 (runtime-gated via fpng_init).
+  target_compile_options(FormatBar PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/arch:SSE2>)
 endif()
 
 target_link_libraries(FormatBar PRIVATE

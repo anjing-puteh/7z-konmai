@@ -37,13 +37,14 @@ class CHandlerCont:
   Z7_IFACEM_IInArchive_Cont(Z7_COM7F_PUREO)
   // Z7_IFACE_COM7_PURE(IInArchive_Cont)
   */
-  Z7_COM7F_IMP(Extract(const UInt32 *indices, UInt32 numItems, Int32 testMode, IArchiveExtractCallback *extractCallback))
+  Z7_COM7F_IMP_NONFINAL(Extract(const UInt32 *indices, UInt32 numItems, Int32 testMode, IArchiveExtractCallback *extractCallback))
 protected:
   Z7_IFACE_COM7_IMP(IInArchiveGetStream)
 
   CMyComPtr<IInStream> _stream;
   virtual int GetItem_ExtractInfo(UInt32 index, UInt64 &pos, UInt64 &size) const = 0;
-  // Optional override: wrap the per-item sequential stream (e.g. decryption) for Extract / GetStream.
+  // Plugin local: allow handlers (IFS/ARC/MAR) to wrap/decode item streams.
+  // Upstream 26.03 Extract/GetStream only create limited raw streams.
   virtual HRESULT CreateItemInStream(UInt32 index, UInt64 pos, UInt64 size, ISequentialInStream **stream);
   // destructor must be virtual for this class
   virtual ~CHandlerCont() {}

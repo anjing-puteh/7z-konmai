@@ -1,5 +1,5 @@
-// Satisfies NExt::IsArc_Ext referenced by HandlerCont.cpp (CHandlerImg / GetImgExt).
-// Full ext2/3/4 detection lives in ExtHandler.cpp; this BAR-only DLL does not need it.
+// ExtIsArcStub.cpp -- stub for NExt::IsArc_Ext when ExtHandler.cpp is not linked.
+// HandlerCont.cpp references IsArc_Ext for image-container auto-detection.
 
 #include "StdAfx.h"
 

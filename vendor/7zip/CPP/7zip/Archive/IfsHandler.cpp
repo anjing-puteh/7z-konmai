@@ -4,9 +4,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "../../Common/ComTry.h"
@@ -21,9 +24,12 @@
 #include "../../Windows/TimeUtils.h"
 
 #include "../Common/LimitedStreams.h"
+#include "../Common/ProgressUtils.h"
 #include "../Common/RegisterArc.h"
 #include "../Common/StreamObjects.h"
 #include "../Common/StreamUtils.h"
+
+#include "../Compress/CopyCoder.h"
 
 #include "HandlerCont.h"
 #include "IArchive.h"
@@ -55,7 +61,6 @@ struct CItem
   UInt64 Offset;
   UInt64 PackSize;
   UInt64 UnpackSize;
-  bool XmlKbin;
   bool HasUnixMTime;
   Int64 UnixMTime;
 
@@ -68,12 +73,61 @@ struct CItem
 
 static UString FixIfsName(const UString &tag)
 {
-  UString s = tag;
-  s.Replace(L"_E", L".");
-  s.Replace(L"__", L"_");
-  if (s.Len() >= 2 && s[0] == L'_' && s[1] >= L'0' && s[1] <= L'9')
-    s.DeleteFrontal(1);
-  return s;
+  // Match ifstools Node.fix_name: walk left-to-right, map _A.._H / __, and
+  // a leading '_' before a digit.
+  if (tag == L"_info_" || tag == L"_super_")
+    return tag;
+
+  UString fixed = tag;
+  unsigned start = 0;
+  for (;;)
+  {
+    int idx = -1;
+    for (unsigned i = start; i < fixed.Len(); i++)
+    {
+      if (fixed[i] == L'_')
+      {
+        idx = (int)i;
+        break;
+      }
+    }
+    if (idx < 0)
+      break;
+    if ((unsigned)idx + 1 >= fixed.Len())
+      break;
+
+    const wchar_t key = fixed[(unsigned)idx + 1];
+    wchar_t repl = 0;
+    if ((unsigned)idx == 0 && key >= L'0' && key <= L'9')
+      repl = key;
+    else
+    {
+      switch (key)
+      {
+        case L'A': repl = L' '; break;
+        case L'B': repl = L'$'; break;
+        case L'C': repl = L'+'; break;
+        case L'D': repl = L'-'; break;
+        case L'E': repl = L'.'; break;
+        case L'F': repl = L':'; break;
+        case L'G': repl = L'@'; break;
+        case L'H': repl = L'~'; break;
+        case L'_': repl = L'_'; break;
+        default:
+          // Invalid escape — leave as-is (ifstools raises; we keep packed form).
+          start = (unsigned)idx + 1;
+          continue;
+      }
+    }
+
+    UString next;
+    next = fixed.Left((unsigned)idx);
+    next += repl;
+    next += fixed.Mid((unsigned)idx + 2, fixed.Len() - (unsigned)idx - 2);
+    fixed = next;
+    start = (unsigned)idx + 1;
+  }
+  return fixed;
 }
 
 static bool ScanS64(const UString &text, unsigned &pos, Int64 &out)
@@ -176,26 +230,9 @@ static void CollectIfsFiles(CKbinXmlNode *node, const UString &pathPrefix, UInt6
     it.Offset = off;
     it.PackSize = sz;
     it.UnpackSize = sz;
-    it.XmlKbin = false;
     it.HasUnixMTime = hasUnixMTime;
     it.UnixMTime = unixMTime;
   }
-}
-
-static bool PathEndsWithXmlCi(const UString &path)
-{
-  static const wchar_t kExt[] = L".xml";
-  const unsigned elen = 4;
-  if (path.Len() < elen)
-    return false;
-  for (unsigned i = 0; i < elen; i++)
-  {
-    const wchar_t a = path[path.Len() - elen + i];
-    const wchar_t b = kExt[i];
-    if (MyCharUpper(a) != MyCharUpper(b))
-      return false;
-  }
-  return true;
 }
 
 static bool PathEndsWithSuffixCi(const UString &path, const wchar_t *suffix)
@@ -226,16 +263,8 @@ static void SplitParentLeaf(const UString &path, UString &parent, UString &leaf)
   leaf = path.Mid((unsigned)(pos + 1), path.Len() - (unsigned)pos - 1);
 }
 
-static bool PathHasDirPrefix(const UString &path, const UString &dir)
-{
-  if (path.Len() <= dir.Len())
-    return false;
-  if (path[dir.Len()] != L'/')
-    return false;
-  return path.Left(dir.Len()) == dir;
-}
-
 static HRESULT ReadItemBlob(IInStream *stream, const CItem &it, CByteBuffer &out);
+static bool DecodeXmlBlob(const CByteBuffer &blob, CKbinXmlNode *&rootOut);
 
 static void Utf8StringMd5HexLower(const UString &s, AString &hexOut)
 {
@@ -265,58 +294,109 @@ static bool FindAttrVal(const CKbinXmlNode *n, const wchar_t *key, UString &out)
   return false;
 }
 
-static bool LeafMatchesMd5File(const UString &leaf, const UString &wantHexLower, bool allowLegacyPng)
+// O(1) MD5 leaf lookup: key is "parent_lower\\nleaf_lower" -> item index, or -2 if ambiguous.
+struct CMd5LeafIndex
 {
-  UString a = leaf;
-  a.MakeLower_Ascii();
-  UString b = wantHexLower;
-  b.MakeLower_Ascii();
-  if (a == b)
-    return true;
-  if (!allowLegacyPng)
-    return false;
-  if (a.Len() != b.Len() + 4)
-    return false;
-  if (a.Left(b.Len()) != b)
-    return false;
-  return PathEndsWithSuffixCi(a, L".png");
-}
+  std::unordered_map<std::string, int> Map;
 
-// If parentEqualsCi is non-NULL, require path parent == that (exact segment, case-insensitive), e.g. L"afp"
-// for files directly under afp/ (not afp/bsi/). Otherwise require PathHasDirPrefix(path, dirPrefix).
-static int FindUniqueItemByHashLeaf(CObjectVector<CItem> &items, const wchar_t *parentEqualsCi,
-    const UString &dirPrefix, const AString &hashHexLower, bool allowLegacyPng)
-{
-  UString want;
-  for (unsigned i = 0; i < hashHexLower.Len(); i++)
-    want += (wchar_t)(unsigned char)hashHexLower[i];
-  want.MakeLower_Ascii();
-
-  int found = -1;
-  for (unsigned i = 0; i < items.Size(); i++)
+  static void AppendUStringLowerAscii(std::string &out, const UString &s)
   {
-    UString parent, leaf;
-    SplitParentLeaf(items[i].Path, parent, leaf);
-    if (parentEqualsCi)
+    for (unsigned i = 0; i < s.Len(); i++)
     {
-      if (MyStringCompareNoCase(parent, parentEqualsCi) != 0)
-        continue;
+      wchar_t c = s[i];
+      if (c >= L'A' && c <= L'Z')
+        c = (wchar_t)(c - L'A' + L'a');
+      out.push_back((char)(unsigned char)c);
     }
-    else
-    {
-      if (!PathHasDirPrefix(items[i].Path, dirPrefix))
-        continue;
-    }
-    if (!LeafMatchesMd5File(leaf, want, allowLegacyPng))
-      continue;
-    if (found >= 0)
-      return -2;
-    found = (int)i;
   }
-  return found;
-}
 
-static void ProcessTexImages(CKbinXmlNode *node, const UString &texDir, CObjectVector<CItem> &items)
+  static void AppendAString(std::string &out, const AString &s)
+  {
+    out.append((const char *)s, s.Len());
+  }
+
+  static std::string MakeKeyFromU(const UString &parentLower, const UString &leafLower)
+  {
+    std::string key;
+    key.reserve((size_t)parentLower.Len() + 1 + (size_t)leafLower.Len());
+    AppendUStringLowerAscii(key, parentLower);
+    key.push_back('\n');
+    AppendUStringLowerAscii(key, leafLower);
+    return key;
+  }
+
+  static std::string MakeKey(const UString &parentLower, const AString &leafLowerAscii)
+  {
+    std::string key;
+    key.reserve((size_t)parentLower.Len() + 1 + (size_t)leafLowerAscii.Len());
+    AppendUStringLowerAscii(key, parentLower);
+    key.push_back('\n');
+    AppendAString(key, leafLowerAscii);
+    return key;
+  }
+
+  void Build(const CObjectVector<CItem> &items)
+  {
+    Map.clear();
+    Map.reserve((size_t)items.Size());
+    for (unsigned i = 0; i < items.Size(); i++)
+    {
+      UString parent, leaf;
+      SplitParentLeaf(items[i].Path, parent, leaf);
+      parent.MakeLower_Ascii();
+      leaf.MakeLower_Ascii();
+      const std::string key = MakeKeyFromU(parent, leaf);
+      const std::unordered_map<std::string, int>::iterator it = Map.find(key);
+      if (it == Map.end())
+        Map.emplace(key, (int)i);
+      else
+        it->second = -2;
+    }
+  }
+
+  int LookupExact(const UString &parentLower, const AString &leafLowerAscii) const
+  {
+    const std::unordered_map<std::string, int>::const_iterator it =
+        Map.find(MakeKey(parentLower, leafLowerAscii));
+    if (it == Map.end())
+      return -1;
+    return it->second;
+  }
+
+  // parentEqualsCi: exact parent (e.g. L"afp"). Else parent folder is dirPrefix
+  // (tex / geo / afp/bsi — flat IFS layout; same as PathHasDirPrefix for those).
+  int Find(const wchar_t *parentEqualsCi, const UString &dirPrefix,
+      const AString &hashHexLower, bool allowLegacyPng) const
+  {
+    UString parent;
+    if (parentEqualsCi)
+      parent = parentEqualsCi;
+    else
+      parent = dirPrefix;
+    parent.MakeLower_Ascii();
+
+    AString hash = hashHexLower;
+    hash.MakeLower_Ascii();
+
+    const int a = LookupExact(parent, hash);
+    if (!allowLegacyPng)
+      return a;
+
+    AString pngLeaf = hash;
+    pngLeaf += ".png";
+    const int b = LookupExact(parent, pngLeaf);
+    if (a == -2 || b == -2)
+      return -2;
+    if (a >= 0 && b >= 0 && a != b)
+      return -2;
+    if (a >= 0)
+      return a;
+    return b;
+  }
+};
+
+static void ProcessTexImages(CKbinXmlNode *node, const UString &texDir,
+    CObjectVector<CItem> &items, const CMd5LeafIndex &index)
 {
   if (FixIfsName(node->Tag) == L"image")
   {
@@ -325,16 +405,17 @@ static void ProcessTexImages(CKbinXmlNode *node, const UString &texDir, CObjectV
     {
       AString md5hex;
       Utf8StringMd5HexLower(nameVal, md5hex);
-      const int idx = FindUniqueItemByHashLeaf(items, NULL, texDir, md5hex, true);
+      const int idx = index.Find(NULL, texDir, md5hex, true);
       if (idx >= 0)
         items[(unsigned)idx].Path = texDir + UString(L"/") + nameVal + UString(L".png");
     }
   }
   for (unsigned i = 0; i < node->Children.Size(); i++)
-    ProcessTexImages(node->Children[i], texDir, items);
+    ProcessTexImages(node->Children[i], texDir, items, index);
 }
 
-static void ProcessAfpList(CKbinXmlNode *node, CObjectVector<CItem> &items)
+static void ProcessAfpList(CKbinXmlNode *node, CObjectVector<CItem> &items,
+    const CMd5LeafIndex &index)
 {
   if (FixIfsName(node->Tag) == L"afp")
   {
@@ -343,10 +424,10 @@ static void ProcessAfpList(CKbinXmlNode *node, CObjectVector<CItem> &items)
     {
       AString md5hex;
       Utf8StringMd5HexLower(afpName, md5hex);
-      const int rootIdx = FindUniqueItemByHashLeaf(items, L"afp", UString(), md5hex, false);
+      const int rootIdx = index.Find(L"afp", UString(), md5hex, false);
       if (rootIdx >= 0)
         items[(unsigned)rootIdx].Path = UString(L"afp/") + afpName;
-      const int idx = FindUniqueItemByHashLeaf(items, NULL, UString(L"afp/bsi"), md5hex, false);
+      const int idx = index.Find(NULL, UString(L"afp/bsi"), md5hex, false);
       if (idx >= 0)
         items[(unsigned)idx].Path = UString(L"afp/bsi/") + afpName;
 
@@ -371,7 +452,7 @@ static void ProcessAfpList(CKbinXmlNode *node, CObjectVector<CItem> &items)
           plain += shapeStr;
           AString ghash;
           Utf8StringMd5HexLower(plain, ghash);
-          const int gidx = FindUniqueItemByHashLeaf(items, NULL, UString(L"geo"), ghash, false);
+          const int gidx = index.Find(NULL, UString(L"geo"), ghash, false);
           if (gidx >= 0)
             items[(unsigned)gidx].Path = UString(L"geo/") + afpName + UString(L"_shape") + UString(shapeStr);
         }
@@ -379,7 +460,7 @@ static void ProcessAfpList(CKbinXmlNode *node, CObjectVector<CItem> &items)
     }
   }
   for (unsigned i = 0; i < node->Children.Size(); i++)
-    ProcessAfpList(node->Children[i], items);
+    ProcessAfpList(node->Children[i], items, index);
 }
 
 static CKbinXmlNode *FindChildByFixTagName(CKbinXmlNode *parent, const wchar_t *want)
@@ -495,13 +576,13 @@ static HRESULT ApplyIfsTexMetadata(IInStream *stream, CObjectVector<CItem> &item
     CByteBuffer blob;
     RINOK(ReadItemBlob(stream, items[ti], blob))
     CKbinXmlNode *tlRoot = NULL;
-    if (!KbinXmlDecodeFromBinary(blob, blob.Size(), tlRoot) || !tlRoot)
+    if (!DecodeXmlBlob(blob, tlRoot))
       continue;
+    std::unique_ptr<CKbinXmlNode> tlOwner(tlRoot);
 
     UString compress;
     CObjectVector<CTexListEntry> entries;
     CollectTextureListMeta(tlRoot, compress, entries);
-    delete tlRoot;
 
     const bool avslz = (MyStringCompareNoCase(compress, L"avslz") == 0);
 
@@ -549,218 +630,6 @@ static HRESULT ApplyIfsTexMetadata(IInStream *stream, CObjectVector<CItem> &item
   return S_OK;
 }
 
-struct TexPngSizingJob
-{
-  unsigned ItemIndex;
-  bool Avslz;
-  UString Format;
-  UInt32 W;
-  UInt32 H;
-  std::unique_ptr<CByteBuffer> Raw;
-};
-
-static HRESULT ComputeIfsTexPngUnpackSizes(IInStream *stream, CObjectVector<CItem> &items,
-    IArchiveOpenCallback *openCallback)
-{
-  UInt64 totalTexPackBytes = 0;
-  for (unsigned i = 0; i < items.Size(); i++)
-  {
-    const CItem &it = items[i];
-    if (!it.TexPng || it.XmlKbin)
-      continue;
-    totalTexPackBytes += it.PackSize;
-  }
-
-  std::vector<TexPngSizingJob> jobs;
-  jobs.reserve((size_t)items.Size());
-  UInt64 readSoFar = 0;
-
-  if (openCallback && totalTexPackBytes != 0)
-  {
-    const UInt64 totalProgress = totalTexPackBytes * 2;
-    RINOK(openCallback->SetTotal(NULL, &totalProgress))
-  }
-
-  for (unsigned i = 0; i < items.Size(); i++)
-  {
-    CItem &it = items[i];
-    if (!it.TexPng || it.XmlKbin)
-      continue;
-
-    std::unique_ptr<CByteBuffer> blob(new CByteBuffer());
-    RINOK(ReadItemBlob(stream, it, *blob))
-
-    TexPngSizingJob job;
-    job.ItemIndex = i;
-    job.Avslz = it.TexAvslz;
-    job.Format = it.TexFormat;
-    job.W = it.TexW;
-    job.H = it.TexH;
-    job.Raw = std::move(blob);
-    jobs.push_back(std::move(job));
-
-    readSoFar += jobs.back().Raw->Size();
-    if (openCallback && totalTexPackBytes != 0)
-      RINOK(openCallback->SetCompleted(NULL, &readSoFar))
-  }
-
-  const size_t n = jobs.size();
-  if (n == 0)
-    return S_OK;
-
-  struct EncodeSlot
-  {
-    bool Ok;
-    UInt64 PngSize;
-  };
-  std::vector<EncodeSlot> slots(n);
-  for (size_t s = 0; s < n; s++)
-    slots[s].Ok = false;
-
-  const UInt64 totalRawBytes = readSoFar;
-
-  const auto runOne = [&](size_t k)
-  {
-    const TexPngSizingJob &job = jobs[k];
-    CByteBuffer pngOut;
-    const bool ok = IfsTexRawToPngBuffer(*job.Raw, job.Raw->Size(), job.Avslz,
-        job.Format, job.W, job.H, pngOut);
-    slots[k].Ok = ok;
-    slots[k].PngSize = ok ? (UInt64)pngOut.Size() : 0;
-  };
-
-  unsigned numThreads = (unsigned)std::thread::hardware_concurrency();
-  if (numThreads == 0)
-    numThreads = 4;
-  numThreads = (std::min)(numThreads, 8u);
-  numThreads = (std::max)(numThreads, 1u);
-  if ((size_t)numThreads > n)
-    numThreads = (unsigned)n;
-
-  std::atomic<UInt64> encodedPackWeight(0);
-
-  if (numThreads <= 1 || n == 1)
-  {
-    for (size_t k = 0; k < n; k++)
-    {
-      runOne(k);
-      if (openCallback && totalTexPackBytes != 0)
-      {
-        const UInt64 w = jobs[k].Raw ? (UInt64)jobs[k].Raw->Size() : 0;
-        const UInt64 completed = totalRawBytes + encodedPackWeight.fetch_add(w) + w;
-        RINOK(openCallback->SetCompleted(NULL, &completed))
-      }
-    }
-  }
-  else
-  {
-    std::mutex cbMtx;
-    std::atomic<size_t> nextIndex(0);
-    std::vector<std::thread> threads;
-    threads.reserve((size_t)numThreads);
-
-    for (unsigned ti = 0; ti < numThreads; ti++)
-    {
-      threads.emplace_back([&]()
-      {
-        for (;;)
-        {
-          const size_t k = nextIndex.fetch_add(1, std::memory_order_relaxed);
-          if (k >= n)
-            break;
-          runOne(k);
-          if (!openCallback || totalTexPackBytes == 0)
-            continue;
-          const UInt64 w = jobs[k].Raw ? (UInt64)jobs[k].Raw->Size() : 0;
-          const UInt64 prev = encodedPackWeight.fetch_add(w, std::memory_order_relaxed);
-          const UInt64 completed = totalRawBytes + prev + w;
-          std::lock_guard<std::mutex> lock(cbMtx);
-          (void)openCallback->SetCompleted(NULL, &completed);
-        }
-      });
-    }
-    for (size_t ti = 0; ti < threads.size(); ti++)
-      threads[ti].join();
-  }
-
-  if (openCallback && totalTexPackBytes != 0)
-  {
-    const UInt64 done = totalTexPackBytes * 2;
-    RINOK(openCallback->SetCompleted(NULL, &done))
-  }
-
-  for (size_t k = 0; k < n; k++)
-  {
-    CItem &it = items[jobs[k].ItemIndex];
-    if (!slots[k].Ok)
-    {
-      it.TexPng = false;
-      it.UnpackSize = it.PackSize;
-      continue;
-    }
-    it.UnpackSize = slots[k].PngSize;
-  }
-
-  return S_OK;
-}
-
-// ifstools ImageFile cache path: raw packed bytes under tex/_cache/<md5(name)> alongside tex/<name>.png
-static bool ItemPathExistsCi(const CObjectVector<CItem> &items, const UString &path)
-{
-  for (unsigned i = 0; i < items.Size(); i++)
-  {
-    if (MyStringCompareNoCase(items[i].Path, path) == 0)
-      return true;
-  }
-  return false;
-}
-
-static void AppendTexCacheVirtualItems(CObjectVector<CItem> &items)
-{
-  const unsigned origCount = items.Size();
-  for (unsigned i = 0; i < origCount; i++)
-  {
-    const CItem &src = items[i];
-    if (src.XmlKbin)
-      continue;
-
-    UString pp, lf;
-    SplitParentLeaf(src.Path, pp, lf);
-    if (MyStringCompareNoCase(pp, L"tex") != 0)
-      continue;
-    if (!PathEndsWithSuffixCi(lf, L".png"))
-      continue;
-    if (lf.IsPrefixedBy_NoCase(L"_canvas_"))
-      continue;
-
-    UString stem = lf;
-    if (stem.Len() >= 4)
-      stem.DeleteFrom(stem.Len() - 4);
-    if (stem.IsEmpty())
-      continue;
-
-    AString md5;
-    Utf8StringMd5HexLower(stem, md5);
-    UString md5u;
-    for (unsigned j = 0; j < md5.Len(); j++)
-      md5u += (wchar_t)(unsigned char)md5[j];
-
-    const UString cachePath = UString(L"tex/_cache/") + md5u;
-    if (ItemPathExistsCi(items, cachePath))
-      continue;
-
-    CItem &c = items.AddNew();
-    c.Path = cachePath;
-    c.Offset = src.Offset;
-    c.PackSize = src.PackSize;
-    c.UnpackSize = src.PackSize;
-    c.XmlKbin = false;
-    c.TexPng = false;
-    c.HasUnixMTime = src.HasUnixMTime;
-    c.UnixMTime = src.UnixMTime;
-  }
-}
-
 static HRESULT ReadItemBlob(IInStream *stream, const CItem &it, CByteBuffer &out)
 {
   out.Alloc((size_t)it.PackSize);
@@ -768,8 +637,31 @@ static HRESULT ReadItemBlob(IInStream *stream, const CItem &it, CByteBuffer &out
   return ReadStream_FAIL(stream, out, (size_t)it.PackSize);
 }
 
+static bool DecodeXmlBlob(const CByteBuffer &blob, CKbinXmlNode *&rootOut)
+{
+  // Binary first; on failure try plaintext with trailing-NUL strip (LovePlus /
+  // uncompressed manifests). UTF-8 MD5 via Utf8StringMd5HexLower matches
+  // ifstools encoding_override='utf8' when the tree does decode.
+  if (KbinXmlIsBinaryXml(blob, blob.Size()))
+  {
+    if (KbinXmlDecodeFromBinary(blob, blob.Size(), rootOut) && rootOut)
+      return true;
+    rootOut = NULL;
+  }
+  size_t n = blob.Size();
+  const Byte *p = blob;
+  while (n > 0 && p[n - 1] == 0)
+    n--;
+  if (n == 0)
+    return false;
+  return KbinXmlDecodeFromPlainXml(p, n, rootOut) && rootOut != NULL;
+}
+
 static HRESULT ApplyIfsMd5Renames(IInStream *stream, CObjectVector<CItem> &items)
 {
+  CMd5LeafIndex index;
+  index.Build(items);
+
   for (unsigned i = 0; i < items.Size(); i++)
   {
     if (!PathEndsWithSuffixCi(items[i].Path, L"texturelist.xml"))
@@ -782,10 +674,10 @@ static HRESULT ApplyIfsMd5Renames(IInStream *stream, CObjectVector<CItem> &items
     CByteBuffer blob;
     RINOK(ReadItemBlob(stream, items[i], blob))
     CKbinXmlNode *root = NULL;
-    if (!KbinXmlDecodeFromBinary(blob, blob.Size(), root) || !root)
+    if (!DecodeXmlBlob(blob, root))
       continue;
-    ProcessTexImages(root, UString(L"tex"), items);
-    delete root;
+    std::unique_ptr<CKbinXmlNode> rootOwner(root);
+    ProcessTexImages(root, UString(L"tex"), items, index);
   }
 
   for (unsigned i = 0; i < items.Size(); i++)
@@ -800,10 +692,10 @@ static HRESULT ApplyIfsMd5Renames(IInStream *stream, CObjectVector<CItem> &items
     CByteBuffer blob;
     RINOK(ReadItemBlob(stream, items[i], blob))
     CKbinXmlNode *root = NULL;
-    if (!KbinXmlDecodeFromBinary(blob, blob.Size(), root) || !root)
+    if (!DecodeXmlBlob(blob, root))
       continue;
-    ProcessAfpList(root, items);
-    delete root;
+    std::unique_ptr<CKbinXmlNode> rootOwner(root);
+    ProcessAfpList(root, items, index);
   }
 
   return S_OK;
@@ -838,23 +730,19 @@ Z7_class_CHandler_final: public CHandlerCont
     if (pos != item.Offset || size != item.UnpackSize)
       return S_FALSE;
 
-    if (!item.XmlKbin && item.TexPng)
+    if (item.TexPng)
     {
-      CMyComPtr<ISequentialInStream> limited;
-      RINOK(CreateLimitedInStream(_stream, item.Offset, item.PackSize, &limited))
-
+      // Encode on demand (Open no longer caches PNGs). Used by GetStream /
+      // single-file preview; bulk Extract uses the pipelined path below.
       if (item.PackSize == 0)
       {
-        if (item.UnpackSize != 0)
-          return S_FALSE;
         Create_BufInStream_WithNewBuffer(NULL, 0, stream);
         return S_OK;
       }
-
       CByteBuffer packed;
       packed.Alloc((size_t)item.PackSize);
-      RINOK(ReadStream_FAIL(limited, packed, (size_t)item.PackSize))
-
+      RINOK(InStream_SeekSet(_stream, item.Offset))
+      RINOK(ReadStream_FAIL(_stream, packed, (size_t)item.PackSize))
       CByteBuffer pngOut;
       if (!IfsTexRawToPngBuffer(packed, packed.Size(), item.TexAvslz,
               item.TexFormat, item.TexW, item.TexH, pngOut))
@@ -863,35 +751,42 @@ Z7_class_CHandler_final: public CHandlerCont
       return S_OK;
     }
 
-    if (!item.XmlKbin)
-      return CreateLimitedInStream(_stream, item.Offset, item.PackSize, stream);
-
-    CMyComPtr<ISequentialInStream> limited;
-    RINOK(CreateLimitedInStream(_stream, item.Offset, item.PackSize, &limited))
-
     if (item.PackSize == 0)
     {
-      if (item.UnpackSize != 0)
-        return S_FALSE;
       Create_BufInStream_WithNewBuffer(NULL, 0, stream);
       return S_OK;
     }
 
-    CByteBuffer packed;
-    packed.Alloc((size_t)item.PackSize);
-    RINOK(ReadStream_FAIL(limited, packed, (size_t)item.PackSize))
+    // Detect binary kbin on read (Open no longer expands every XML for Size).
+    Byte magic[2];
+    if (item.PackSize >= 2)
+    {
+      RINOK(InStream_SeekSet(_stream, item.Offset))
+      RINOK(ReadStream_FAIL(_stream, magic, 2))
+      if (KbinXmlIsBinaryXml(magic, 2))
+      {
+        CByteBuffer packed;
+        packed.Alloc((size_t)item.PackSize);
+        RINOK(InStream_SeekSet(_stream, item.Offset))
+        RINOK(ReadStream_FAIL(_stream, packed, (size_t)item.PackSize))
 
-    CKbinXmlNode *root = NULL;
-    if (!KbinXmlDecodeFromBinary(packed, packed.Size(), root) || !root)
-      return S_FALSE;
-    CByteBuffer utf8;
-    const bool ok = KbinXmlTreeToUtf8Text(root, utf8);
-    delete root;
-    if (!ok)
-      return S_FALSE;
-    Create_BufInStream_WithNewBuffer(utf8, utf8.Size(), stream);
-    return S_OK;
+        CKbinXmlNode *root = NULL;
+        if (!KbinXmlDecodeFromBinary(packed, packed.Size(), root) || !root)
+          return S_FALSE;
+        std::unique_ptr<CKbinXmlNode> rootOwner(root);
+        CByteBuffer utf8;
+        if (!KbinXmlTreeToUtf8Text(root, utf8))
+          return S_FALSE;
+        Create_BufInStream_WithNewBuffer(utf8, utf8.Size(), stream);
+        return S_OK;
+      }
+    }
+
+    return CreateLimitedInStream(_stream, item.Offset, item.PackSize, stream);
   }
+
+  Z7_COM7F_IMP(Extract(const UInt32 *indices, UInt32 numItems, Int32 testMode,
+      IArchiveExtractCallback *extractCallback))
 };
 
 static const Byte kProps[] =
@@ -974,17 +869,20 @@ HRESULT CHandler::Open2(IInStream *stream, IArchiveOpenCallback *openCallback)
   if (ReadUInt32BE(hdr) != kIfsMagic)
     return S_FALSE;
 
-  const UInt16 ver = ReadUInt16BE(hdr + 4);
-  const UInt16 verInv = ReadUInt16BE(hdr + 6);
-  if ((UInt16)(ver ^ verInv) != 0xFFFF)
+  // ifstools: header u16 is IFSFlags bitfield, not a version number.
+  const UInt16 flags = ReadUInt16BE(hdr + 4);
+  const UInt16 flagsInv = ReadUInt16BE(hdr + 6);
+  if ((UInt16)(flags ^ flagsInv) != 0xFFFF)
     return S_FALSE;
+
+  static const UInt16 kIfsFlag_HasMD5 = 2;
 
   _arcUnixTime = ReadUInt32BE(hdr + 8);
   /* UInt32 treeSize = */ ReadUInt32BE(hdr + 12);
   const UInt32 manifestEnd = ReadUInt32BE(hdr + 16);
 
   size_t headerEnd = 20;
-  if (ver > 1)
+  if ((flags & kIfsFlag_HasMD5) != 0)
   {
     if (_fileSize < 36)
       return S_FALSE;
@@ -1006,61 +904,337 @@ HRESULT CHandler::Open2(IInStream *stream, IArchiveOpenCallback *openCallback)
   RINOK(ReadStream_FAIL(stream, manifest, manifestLen))
 
   CKbinXmlNode *root = NULL;
-  if (!KbinXmlDecodeFromBinary(manifest, manifest.Size(), root) || !root)
+  if (!KbinXmlDecodeAuto(manifest, manifest.Size(), root) || !root)
     return S_FALSE;
+  std::unique_ptr<CKbinXmlNode> rootOwner(root);
 
   CollectIfsFiles(root, UString(), dataBase, _fileSize, _items);
-  delete root;
+  rootOwner.reset();
 
-  for (unsigned i = 0; i < _items.Size(); i++)
-  {
-    CItem &it = _items[i];
-    if (!PathEndsWithXmlCi(it.Path) || it.PackSize == 0)
-    {
-      it.XmlKbin = false;
-      it.UnpackSize = it.PackSize;
-      continue;
-    }
-
-    CByteBuffer blob;
-    blob.Alloc((size_t)it.PackSize);
-    RINOK(InStream_SeekSet(stream, it.Offset))
-    RINOK(ReadStream_FAIL(stream, blob, (size_t)it.PackSize))
-
-    if (!KbinXmlIsBinaryXml(blob, blob.Size()))
-    {
-      it.XmlKbin = false;
-      it.UnpackSize = it.PackSize;
-      continue;
-    }
-
-    CKbinXmlNode *xmlRoot = NULL;
-    if (!KbinXmlDecodeFromBinary(blob, blob.Size(), xmlRoot) || !xmlRoot)
-    {
-      it.XmlKbin = false;
-      it.UnpackSize = it.PackSize;
-      continue;
-    }
-
-    CByteBuffer utf8;
-    if (!KbinXmlTreeToUtf8Text(xmlRoot, utf8))
-    {
-      delete xmlRoot;
-      it.XmlKbin = false;
-      it.UnpackSize = it.PackSize;
-      continue;
-    }
-    delete xmlRoot;
-    it.XmlKbin = true;
-    it.UnpackSize = (UInt64)utf8.Size();
-  }
-
+  // UnpackSize stays PackSize for listing (tex PNG and kbin UTF-8 expand on
+  // Extract / GetStream). Avoid reading every .xml blob during Open.
   RINOK(ApplyIfsMd5Renames(stream, _items))
   RINOK(ApplyIfsTexMetadata(stream, _items))
-  RINOK(ComputeIfsTexPngUnpackSizes(stream, _items, openCallback))
-  AppendTexCacheVirtualItems(_items);
 
   return _items.IsEmpty() ? (HRESULT)S_FALSE : S_OK;
+}
+
+Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 numItems,
+    Int32 testMode, IArchiveExtractCallback *extractCallback))
+{
+  COM_TRY_BEGIN
+  const bool allFilesMode = (numItems == (UInt32)(Int32)-1);
+  if (allFilesMode)
+  {
+    RINOK(GetNumberOfItems(&numItems))
+  }
+  if (numItems == 0)
+    return S_OK;
+
+  // Progress total: packed bytes (tex UnpackSize is a pack-size placeholder).
+  UInt64 totalSize = 0;
+  for (UInt32 i = 0; i < numItems; i++)
+  {
+    const UInt32 index = allFilesMode ? i : indices[i];
+    if (index < _items.Size())
+      totalSize += _items[index].PackSize;
+  }
+  RINOK(extractCallback->SetTotal(totalSize))
+
+  CMyComPtr2_Create<ICompressProgressInfo, CLocalProgress> lps;
+  lps->Init(extractCallback, false);
+  CMyComPtr2_Create<ICompressCoder, NCompress::CCopyCoder> copyCoder;
+
+  // Prefetch window: encode the next N textures on workers while the main
+  // thread writes earlier results in order.
+  unsigned window = (unsigned)std::thread::hardware_concurrency();
+  if (window == 0)
+    window = 4;
+  window = (std::min)(window, 8u);
+  window = (std::max)(window, 1u);
+
+  struct TexSlot
+  {
+    bool Active;
+    bool Done;
+    bool Ok;
+    CByteBuffer Png;
+    TexSlot(): Active(false), Done(false), Ok(false) {}
+  };
+
+  std::vector<TexSlot> slots((size_t)numItems);
+  std::mutex mtx;
+  std::condition_variable cv;
+  std::atomic<bool> abortFlag(false);
+
+  // Pre-read packed blobs on this thread; hand to workers.
+  struct Prefetch
+  {
+    bool Needed;
+    bool Ready;
+    CByteBuffer Raw;
+    Prefetch(): Needed(false), Ready(false) {}
+  };
+  std::vector<Prefetch> pref((size_t)numItems);
+  for (UInt32 i = 0; i < numItems; i++)
+  {
+    const UInt32 index = allFilesMode ? i : indices[i];
+    if (index >= _items.Size())
+      continue;
+    const CItem &item = _items[index];
+    if (item.TexPng)
+      pref[(size_t)i].Needed = true;
+  }
+
+  std::atomic<UInt32> nextPrefetch(0);
+  std::mutex prefMtx;
+
+  auto ensurePrefetched = [&](UInt32 upToExclusive) -> HRESULT
+  {
+    for (;;)
+    {
+      UInt32 i = nextPrefetch.load(std::memory_order_relaxed);
+      if (i >= upToExclusive || i >= numItems)
+        break;
+      if (!nextPrefetch.compare_exchange_weak(i, i + 1, std::memory_order_relaxed))
+        continue;
+      if (!pref[(size_t)i].Needed)
+        continue;
+      const UInt32 index = allFilesMode ? i : indices[i];
+      const CItem &item = _items[index];
+      CByteBuffer raw;
+      if (item.PackSize != 0)
+      {
+        raw.Alloc((size_t)item.PackSize);
+        RINOK(InStream_SeekSet(_stream, item.Offset))
+        RINOK(ReadStream_FAIL(_stream, raw, (size_t)item.PackSize))
+      }
+      {
+        std::lock_guard<std::mutex> lock(prefMtx);
+        pref[(size_t)i].Raw = raw;
+        pref[(size_t)i].Ready = true;
+      }
+      cv.notify_all();
+    }
+    return S_OK;
+  };
+
+  std::atomic<UInt32> nextToEncode(0);
+  const unsigned numWorkers = window;
+
+  auto workerFn = [&]()
+  {
+    for (;;)
+    {
+      if (abortFlag.load(std::memory_order_relaxed))
+        break;
+      const UInt32 i = nextToEncode.fetch_add(1, std::memory_order_relaxed);
+      if (i >= numItems)
+        break;
+      if (!pref[(size_t)i].Needed)
+        continue;
+
+      // Wait until main thread has prefetched this slot's raw bytes.
+      {
+        std::unique_lock<std::mutex> lock(prefMtx);
+        cv.wait(lock, [&]() {
+          return abortFlag.load(std::memory_order_relaxed) || pref[(size_t)i].Ready;
+        });
+      }
+      if (abortFlag.load(std::memory_order_relaxed))
+        break;
+
+      const UInt32 index = allFilesMode ? i : indices[i];
+      const CItem &item = _items[index];
+      CByteBuffer raw;
+      {
+        std::lock_guard<std::mutex> lock(prefMtx);
+        raw = pref[(size_t)i].Raw;
+        pref[(size_t)i].Raw.Free();
+      }
+
+      CByteBuffer png;
+      bool ok = true;
+      if (item.PackSize != 0)
+        ok = IfsTexRawToPngBuffer(raw, raw.Size(), item.TexAvslz,
+            item.TexFormat, item.TexW, item.TexH, png);
+      raw.Free();
+
+      {
+        std::lock_guard<std::mutex> lock(mtx);
+        slots[(size_t)i].Active = true;
+        slots[(size_t)i].Ok = ok;
+        slots[(size_t)i].Png = png;
+        slots[(size_t)i].Done = true;
+      }
+      cv.notify_all();
+    }
+  };
+
+  // Kick prefetch for the first window, then start workers.
+  RINOK(ensurePrefetched((std::min)(numItems, (UInt32)window)))
+
+  std::vector<std::thread> workers;
+  workers.reserve((size_t)numWorkers);
+  for (unsigned w = 0; w < numWorkers; w++)
+    workers.emplace_back(workerFn);
+
+  UInt64 completedPack = 0;
+  HRESULT failHr = S_OK;
+
+  for (UInt32 i = 0; i < numItems; i++)
+  {
+    // Keep prefetch window ahead of the write cursor.
+    {
+      const UInt32 ahead = i + (UInt32)window + 1;
+      const HRESULT phr = ensurePrefetched((std::min)(numItems, ahead));
+      if (phr != S_OK)
+      {
+        failHr = phr;
+        abortFlag.store(true, std::memory_order_relaxed);
+        cv.notify_all();
+        break;
+      }
+    }
+
+    lps->InSize = completedPack;
+    lps->OutSize = completedPack;
+    {
+      const HRESULT phr = lps->SetCur();
+      if (phr != S_OK)
+      {
+        failHr = phr;
+        abortFlag.store(true, std::memory_order_relaxed);
+        cv.notify_all();
+        break;
+      }
+    }
+
+    CMyComPtr<ISequentialOutStream> outStream;
+    const Int32 askMode = testMode ?
+        NExtract::NAskMode::kTest :
+        NExtract::NAskMode::kExtract;
+    const UInt32 index = allFilesMode ? i : indices[i];
+
+    {
+      const HRESULT phr = extractCallback->GetStream(index, &outStream, askMode);
+      if (phr != S_OK)
+      {
+        failHr = phr;
+        abortFlag.store(true, std::memory_order_relaxed);
+        cv.notify_all();
+        break;
+      }
+    }
+
+    int opRes = NExtract::NOperationResult::kDataError;
+    UInt64 packForProgress = 0;
+    if (index < _items.Size())
+      packForProgress = _items[index].PackSize;
+    completedPack += packForProgress;
+
+    if (!testMode && !outStream)
+    {
+      // Skip write but still wait for any in-flight encode to free memory.
+      if (index < _items.Size() && _items[index].TexPng)
+      {
+        std::unique_lock<std::mutex> lock(mtx);
+        cv.wait(lock, [&]() {
+          return abortFlag.load(std::memory_order_relaxed) || slots[(size_t)i].Done;
+        });
+        slots[(size_t)i].Png.Free();
+      }
+      continue;
+    }
+
+    {
+      const HRESULT phr = extractCallback->PrepareOperation(askMode);
+      if (phr != S_OK)
+      {
+        failHr = phr;
+        abortFlag.store(true, std::memory_order_relaxed);
+        cv.notify_all();
+        break;
+      }
+    }
+
+    if (index >= _items.Size())
+    {
+      RINOK(extractCallback->SetOperationResult(opRes))
+      continue;
+    }
+
+    const CItem &item = _items[index];
+
+    if (item.TexPng)
+    {
+      {
+        std::unique_lock<std::mutex> lock(mtx);
+        cv.wait(lock, [&]() {
+          return abortFlag.load(std::memory_order_relaxed) || slots[(size_t)i].Done;
+        });
+      }
+      if (abortFlag.load(std::memory_order_relaxed) && !slots[(size_t)i].Done)
+        break;
+
+      if (!slots[(size_t)i].Ok)
+        opRes = NExtract::NOperationResult::kDataError;
+      else
+      {
+        CMyComPtr<ISequentialInStream> inStream;
+        Create_BufInStream_WithReference(slots[(size_t)i].Png, slots[(size_t)i].Png.Size(),
+            NULL, &inStream);
+        const HRESULT codeHr = copyCoder.Interface()->Code(inStream, outStream, NULL, NULL, lps);
+        const UInt64 wrote = copyCoder->TotalSize;
+        slots[(size_t)i].Png.Free();
+        if (codeHr != S_OK)
+          opRes = NExtract::NOperationResult::kDataError;
+        else if (wrote == 0 && item.PackSize != 0)
+          opRes = NExtract::NOperationResult::kDataError;
+        else
+          opRes = NExtract::NOperationResult::kOK;
+      }
+    }
+    else
+    {
+      CMyComPtr<ISequentialInStream> inStream;
+      const HRESULT cr = CreateItemInStream(index, item.Offset, item.UnpackSize, &inStream);
+      if (cr != S_OK || !inStream)
+        opRes = NExtract::NOperationResult::kDataError;
+      else
+      {
+        const HRESULT codeHr = copyCoder.Interface()->Code(inStream, outStream, NULL, NULL, lps);
+        // UnpackSize may be a pack-size placeholder for binary kbin; accept
+        // whatever length the decode/copy actually wrote.
+        if (codeHr != S_OK)
+          opRes = NExtract::NOperationResult::kDataError;
+        else
+          opRes = NExtract::NOperationResult::kOK;
+      }
+    }
+
+    outStream.Release();
+    {
+      const HRESULT phr = extractCallback->SetOperationResult(opRes);
+      if (phr != S_OK)
+      {
+        failHr = phr;
+        abortFlag.store(true, std::memory_order_relaxed);
+        cv.notify_all();
+        break;
+      }
+    }
+  }
+
+  abortFlag.store(true, std::memory_order_relaxed);
+  cv.notify_all();
+  for (size_t w = 0; w < workers.size(); w++)
+    workers[w].join();
+
+  if (failHr != S_OK)
+    return failHr;
+  return S_OK;
+  COM_TRY_END
 }
 
 Z7_COM7F_IMF(CHandler::Open(IInStream *inStream,

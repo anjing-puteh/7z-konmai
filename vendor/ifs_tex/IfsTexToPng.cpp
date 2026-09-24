@@ -6,7 +6,7 @@
 
 #include "../7zip/CPP/Common/MyString.h"
 #include "../arc/DdrLz77.h"
-#include "../lodepng/lodepng.h"
+#include "../fpng/fpng.h"
 
 static UInt32 ReadUInt32BE(const Byte *p)
 {
@@ -23,7 +23,8 @@ static bool PixelPayloadAvslz(const Byte *raw, size_t rawSize, CByteBuffer &outP
   {
     std::vector<uint8_t> dec = util::lz77::decompress(
         (uint8_t *)(void *)(raw + 8),
-        rawSize - 8);
+        rawSize - 8,
+        (size_t)uncompressed_size);
     if (dec.size() != (size_t)uncompressed_size)
       return false;
     outPixels.Alloc(dec.size());
@@ -278,6 +279,13 @@ bool IfsTexRawToPngBuffer(const Byte *raw, size_t rawSize, bool avslz,
   if (!isArgb && !isArgb4444 && !isBc1 && !isBc3)
     return false;
 
+  // Reject dimensions that would overflow size_t when forming RGBA / PNG buffers.
+  if ((size_t)width > (size_t)-1 / (size_t)height)
+    return false;
+  const size_t npixCheck = (size_t)width * (size_t)height;
+  if (npixCheck > (size_t)-1 / 4)
+    return false;
+
   CByteBuffer pix;
   if (avslz)
   {
@@ -287,7 +295,7 @@ bool IfsTexRawToPngBuffer(const Byte *raw, size_t rawSize, bool avslz,
   else if (!PixelPayloadRaw(raw, rawSize, pix))
     return false;
 
-  const size_t npix = (size_t)width * (size_t)height;
+  const size_t npix = npixCheck;
   const size_t rgbaBytes = npix * 4;
   CByteBuffer rgba;
 
@@ -364,17 +372,22 @@ bool IfsTexRawToPngBuffer(const Byte *raw, size_t rawSize, bool avslz,
 
   unsigned char *pngBuf = NULL;
   size_t pngLen = 0;
-  const unsigned err = lodepng_encode32(&pngBuf, &pngLen,
-      rgba, (unsigned)width, (unsigned)height);
-  if (err || !pngBuf || pngLen == 0)
-  {
-    if (pngBuf)
-      free(pngBuf);
-    return false;
-  }
 
-  pngOut.Alloc(pngLen);
-  memcpy(pngOut, pngBuf, pngLen);
-  free(pngBuf);
+  // fpng: SIMD deflate PNG, comparable speed to ifstools' png/fdeflate path.
+  {
+    static bool s_fpngInited = false;
+    if (!s_fpngInited)
+    {
+      fpng::fpng_init();
+      s_fpngInited = true;
+    }
+  }
+  std::vector<uint8_t> fpngOut;
+  if (!fpng::fpng_encode_image_to_memory(rgba, width, height, 4, fpngOut, 0)
+      || fpngOut.empty())
+    return false;
+
+  pngOut.Alloc(fpngOut.size());
+  memcpy(pngOut, fpngOut.data(), fpngOut.size());
   return true;
 }
